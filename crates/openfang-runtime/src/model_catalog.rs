@@ -175,6 +175,37 @@ impl ModelCatalog {
         }
     }
 
+    /// Register a custom provider from config.toml `[[custom_providers]]`.
+    ///
+    /// Adds a `ProviderInfo` entry so the provider appears in `/api/providers` and the dashboard.
+    /// Skips if a provider with the same ID already exists.
+    pub fn register_custom_provider(&mut self, config: &openfang_types::config::CustomProviderConfig) {
+        if self.providers.iter().any(|p| p.id == config.name) {
+            return;
+        }
+        let has_key = if config.api_key_env.is_empty() {
+            false
+        } else {
+            std::env::var(&config.api_key_env).is_ok()
+        };
+        let auth_status = if !config.key_required {
+            AuthStatus::NotRequired
+        } else if has_key {
+            AuthStatus::Configured
+        } else {
+            AuthStatus::Missing
+        };
+        self.providers.push(ProviderInfo {
+            id: config.name.clone(),
+            display_name: config.name.clone(),
+            api_key_env: config.api_key_env.clone(),
+            base_url: config.base_url.clone(),
+            key_required: config.key_required,
+            auth_status,
+            model_count: 0,
+        });
+    }
+
     /// List models filtered by tier.
     pub fn models_by_tier(&self, tier: ModelTier) -> Vec<&ModelCatalogEntry> {
         self.models.iter().filter(|m| m.tier == tier).collect()

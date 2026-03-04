@@ -14,20 +14,14 @@ use tracing::debug;
 /// Enhanced web fetch engine with SSRF protection and readability extraction.
 pub struct WebFetchEngine {
     config: WebFetchConfig,
-    client: reqwest::Client,
     cache: Arc<WebCache>,
 }
 
 impl WebFetchEngine {
     /// Create a new fetch engine from config with a shared cache.
     pub fn new(config: WebFetchConfig, cache: Arc<WebCache>) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_secs))
-            .build()
-            .unwrap_or_default();
         Self {
             config,
-            client,
             cache,
         }
     }
@@ -47,8 +41,32 @@ impl WebFetchEngine {
     ) -> Result<String, String> {
         let method_upper = method.to_uppercase();
 
-        // Step 1: SSRF protection — BEFORE any network I/O
-        check_ssrf(url)?;
+        // Step 1: SSRF protection — Resolve and Verify IP
+        let host = extract_host(url);
+        let hostname = if host.starts_with('[') {
+            host.find(']').map(|i| &host[..=i]).unwrap_or(&host)
+        } else {
+            host.split(':').next().unwrap_or(&host)
+        };
+        let port = if url.starts_with("https") { 443 } else { 80 };
+
+        // Resolve DNS and check every returned IP
+        let addrs = format!("{}:{}", hostname, port)
+            .to_socket_addrs()
+            .map_err(|e| format!("Failed to resolve hostname '{}': {e}", hostname))?;
+
+        let mut verified_ip = None;
+        for addr in addrs {
+            let ip = addr.ip();
+            if ip.is_loopback() || ip.is_unspecified() || is_private_ip(&ip) {
+                return Err(format!("SSRF blocked: {hostname} resolves to private IP {ip}"));
+            }
+            if verified_ip.is_none() {
+                verified_ip = Some(addr);
+            }
+        }
+
+        let socket_addr = verified_ip.ok_or_else(|| format!("No valid public IP found for {hostname}"))?;
 
         // Step 2: Cache lookup (only for GET)
         let cache_key = format!("fetch:{}:{}", method_upper, url);
@@ -59,13 +77,21 @@ impl WebFetchEngine {
             }
         }
 
-        // Step 3: Build request with configured method
+        // Step 3: Build request using a pinned connection to prevent DNS rebinding
+        // We create a temporary client pinned to the verified IP for this hostname.
+        // SECURITY: This is the critical fix for TOCTOU DNS Rebinding.
+        let pinned_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(self.config.timeout_secs))
+            .resolve(hostname, socket_addr)
+            .build()
+            .map_err(|e| format!("Failed to build pinned HTTP client: {e}"))?;
+
         let mut req = match method_upper.as_str() {
-            "POST" => self.client.post(url),
-            "PUT" => self.client.put(url),
-            "PATCH" => self.client.patch(url),
-            "DELETE" => self.client.delete(url),
-            _ => self.client.get(url),
+            "POST" => pinned_client.post(url),
+            "PUT" => pinned_client.put(url),
+            "PATCH" => pinned_client.patch(url),
+            "DELETE" => pinned_client.delete(url),
+            _ => pinned_client.get(url),
         };
         req = req.header("User-Agent", "Mozilla/5.0 (compatible; OpenFangAgent/0.1)");
 
@@ -173,6 +199,13 @@ fn is_html(content_type: &str, body: &str) -> bool {
 // ---------------------------------------------------------------------------
 // SSRF Protection (replicates host_functions.rs logic for builtin tools)
 // ---------------------------------------------------------------------------
+
+impl WebFetchEngine {
+    /// Resolve a URL and check for SSRF.
+    pub fn validate_url(&self, url: &str) -> Result<(), String> {
+        check_ssrf(url)
+    }
+}
 
 /// Check if a URL targets a private/internal network resource.
 /// Blocks localhost, metadata endpoints, and private IPs.

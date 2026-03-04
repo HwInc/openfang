@@ -196,12 +196,15 @@ fn fetch_unseen_emails(
     password: &str,
     folders: &[String],
 ) -> Result<Vec<(String, String, String, String)>, String> {
-    let tls = native_tls::TlsConnector::builder()
-        .build()
+    let tcp = std::net::TcpStream::connect((host, port))
+        .map_err(|e| format!("IMAP TCP connect failed: {e}"))?;
+    let connector = rustls_connector::RustlsConnector::new_with_native_certs()
         .map_err(|e| format!("TLS connector error: {e}"))?;
-
-    let client = imap::connect((host, port), host, &tls)
-        .map_err(|e| format!("IMAP connect failed: {e}"))?;
+    let tls_stream = connector
+        .connect(host, tcp)
+        .map_err(|e| format!("TLS connect failed: {e}"))?;
+    let client: imap::Client<rustls_connector::TlsStream<std::net::TcpStream>> =
+        imap::Client::new(tls_stream);
 
     let mut session = client
         .login(username, password)

@@ -482,6 +482,13 @@ pub struct AgentManifest {
     /// Tool blocklist — these tools are excluded (applied after allowlist).
     #[serde(default, deserialize_with = "crate::serde_compat::vec_lenient")]
     pub tool_blocklist: Vec<String>,
+    /// SECURITY: Whether this manifest has been verified by a trusted signer
+    /// or is a bundled/internal manifest.
+    #[serde(skip)]
+    pub is_trusted: bool,
+    /// SECURITY: The ID of the signer if verified.
+    #[serde(skip)]
+    pub signer_id: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -516,6 +523,8 @@ impl Default for AgentManifest {
             exec_policy: None,
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
+            is_trusted: false,
+            signer_id: None,
         }
     }
 }
@@ -773,6 +782,8 @@ mod tests {
             exec_policy: None,
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
+            is_trusted: false,
+            signer_id: None,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let deserialized: AgentManifest = serde_json::from_str(&json).unwrap();

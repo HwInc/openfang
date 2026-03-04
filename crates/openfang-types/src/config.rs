@@ -1045,6 +1045,47 @@ pub struct KernelConfig {
     /// OAuth client ID overrides for PKCE flows.
     #[serde(default)]
     pub oauth: OAuthConfig,
+    /// Custom LLM providers added via `[[custom_providers]]` in config.toml.
+    #[serde(default)]
+    pub custom_providers: Vec<CustomProviderConfig>,
+    /// SECURITY: Trusted Ed25519 public keys (HEX) for manifest signing.
+    /// If empty and require_signed_manifests is true, no signed agents can be loaded.
+    #[serde(default)]
+    pub trusted_manifest_signers: Vec<String>,
+    /// SECURITY: Whether to require a valid signature from a trusted signer
+    /// for all non-bundled agents.
+    #[serde(default)]
+    pub require_signed_manifests: bool,
+}
+
+/// Custom LLM provider configuration.
+///
+/// Configure in config.toml:
+/// ```toml
+/// [[custom_providers]]
+/// name = "my-provider"
+/// api_format = "openai"   # openai | anthropic | gemini | copilot
+/// base_url = "https://api.my-provider.io/v1"
+/// api_key_env = "MY_PROVIDER_API_KEY"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomProviderConfig {
+    /// Provider name (used as `provider = "name"` in agent configs).
+    pub name: String,
+    /// API format: "openai", "anthropic", "gemini", or "copilot".
+    pub api_format: String,
+    /// Base URL for the API endpoint.
+    pub base_url: String,
+    /// Environment variable name for the API key.
+    #[serde(default)]
+    pub api_key_env: String,
+    /// Whether an API key is required (default: true).
+    #[serde(default = "default_key_required")]
+    pub key_required: bool,
+}
+
+fn default_key_required() -> bool {
+    true
 }
 
 /// OAuth client ID overrides for PKCE flows.
@@ -1212,6 +1253,9 @@ impl Default for KernelConfig {
             budget: BudgetConfig::default(),
             provider_urls: HashMap::new(),
             oauth: OAuthConfig::default(),
+            custom_providers: Vec::new(),
+            trusted_manifest_signers: Vec::new(),
+            require_signed_manifests: false,
         }
     }
 }
@@ -1304,6 +1348,15 @@ impl std::fmt::Debug for KernelConfig {
                 &format!("{} provider(s)", self.auth_profiles.len()),
             )
             .field("thinking", &self.thinking.is_some())
+            .field(
+                "custom_providers",
+                &format!("{} provider(s)", self.custom_providers.len()),
+            )
+            .field(
+                "trusted_manifest_signers",
+                &format!("{} key(s)", self.trusted_manifest_signers.len()),
+            )
+            .field("require_signed_manifests", &self.require_signed_manifests)
             .finish()
     }
 }

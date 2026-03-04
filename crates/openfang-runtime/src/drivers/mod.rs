@@ -314,6 +314,18 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         return Ok(Arc::new(openai::OpenAIDriver::new(api_key, base_url)));
     }
 
+    // Custom provider with api_format — route to the correct driver
+    if let Some(ref api_format) = config.api_format {
+        let api_key = config.api_key.clone().unwrap_or_default();
+        let base_url = config.base_url.clone().unwrap_or_default();
+        return match api_format.as_str() {
+            "anthropic" => Ok(Arc::new(anthropic::AnthropicDriver::new(api_key, base_url))),
+            "gemini" => Ok(Arc::new(gemini::GeminiDriver::new(api_key, base_url))),
+            "copilot" => Ok(Arc::new(copilot::CopilotDriver::new(api_key, base_url))),
+            _ => Ok(Arc::new(openai::OpenAIDriver::new(api_key, base_url))),
+        };
+    }
+
     // Unknown provider — if base_url is set, treat as custom OpenAI-compatible
     if let Some(ref base_url) = config.base_url {
         let api_key = config.api_key.clone().unwrap_or_default();
@@ -329,7 +341,7 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
             "Unknown provider '{}'. Supported: anthropic, gemini, openai, groq, openrouter, \
              deepseek, together, mistral, fireworks, ollama, vllm, lmstudio, perplexity, \
              cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, github-copilot, \
-             codex, claude-code. Or set base_url for a custom OpenAI-compatible endpoint.",
+             codex, claude-code. Or define custom providers in config.toml with [[custom_providers]].",
             provider
         ),
     })
@@ -407,6 +419,7 @@ mod tests {
             provider: "my-custom-llm".to_string(),
             api_key: Some("test".to_string()),
             base_url: Some("http://localhost:9999/v1".to_string()),
+            api_format: None,
         };
         let driver = create_driver(&config);
         assert!(driver.is_ok());
@@ -418,6 +431,7 @@ mod tests {
             provider: "nonexistent".to_string(),
             api_key: None,
             base_url: None,
+            api_format: None,
         };
         let driver = create_driver(&config);
         assert!(driver.is_err());

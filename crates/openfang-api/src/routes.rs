@@ -52,19 +52,21 @@ pub async fn spawn_agent(
         );
     }
 
-    // SECURITY: Verify Ed25519 signature when a signed manifest is provided
-    if let Some(ref signed_json) = req.signed_manifest {
+    // Determine the manifest source. Use verified content if signature is valid.
+    let manifest: AgentManifest = if let Some(ref signed_json) = req.signed_manifest {
         match state.kernel.verify_signed_manifest(signed_json) {
             Ok(verified_toml) => {
-                // Ensure the signed manifest matches the provided manifest_toml
-                if verified_toml.trim() != req.manifest_toml.trim() {
-                    tracing::warn!("Signed manifest content does not match manifest_toml");
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(
-                            serde_json::json!({"error": "Signed manifest content does not match manifest_toml"}),
-                        ),
-                    );
+                // Ensure the signed manifest matches the provided manifest_toml (optional safety check)
+                // We'll parse the verified one as it now contains trust metadata
+                match toml::from_str(&verified_toml) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!("Failed to parse verified manifest TOML: {e}");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": "Verified manifest parsing failed"})),
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -77,20 +79,20 @@ pub async fn spawn_agent(
                 );
                 return (
                     StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({"error": "Manifest signature verification failed"})),
+                    Json(serde_json::json!({"error": format!("Manifest signature verification failed: {e}")})),
                 );
             }
         }
-    }
-
-    let manifest: AgentManifest = match toml::from_str(&req.manifest_toml) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!("Invalid manifest TOML: {e}");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid manifest format"})),
-            );
+    } else {
+        match toml::from_str(&req.manifest_toml) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("Invalid manifest TOML: {e}");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid manifest format"})),
+                );
+            }
         }
     };
 
@@ -2649,7 +2651,7 @@ pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoRespo
         "panic_count": health.panic_count,
         "restart_count": health.restart_count,
         "agent_count": state.kernel.registry.count(),
-        "database": if db_ok { "connected" } else { "error" },
+        "database": if db_ok { "ok" } else { "error" },
         "config_warnings": config_warnings,
     }))
 }
@@ -6493,6 +6495,7 @@ pub async fn test_provider(
         } else {
             Some(base_url)
         },
+        api_format: None,
     };
 
     match openfang_runtime::drivers::create_driver(&driver_config) {

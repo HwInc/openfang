@@ -29,7 +29,7 @@ hex = { workspace = true }
 
 lettre = { workspace = true }
 imap = { workspace = true }
-native-tls = { workspace = true }
+rustls-connector = { workspace = true }
 mailparse = { workspace = true }
 
 [dev-dependencies]

@@ -30,6 +30,11 @@ zeroize = { workspace = true }
 dashmap = { workspace = true }
 regex-lite = { workspace = true }
 tokio-tungstenite = "0.24"
+rusqlite = { workspace = true }
+aes-gcm = { workspace = true }
+argon2 = { workspace = true }
+rand = { workspace = true }
+dirs = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

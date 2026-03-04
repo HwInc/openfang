@@ -161,6 +161,9 @@ pub struct DriverConfig {
     pub api_key: Option<String>,
     /// Base URL override.
     pub base_url: Option<String>,
+    /// API format override for custom providers ("openai", "anthropic", "gemini", "copilot").
+    #[serde(default)]
+    pub api_format: Option<String>,
 }
 
 /// SECURITY: Custom Debug impl redacts the API key.
@@ -170,6 +173,7 @@ impl std::fmt::Debug for DriverConfig {
             .field("provider", &self.provider)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("base_url", &self.base_url)
+            .field("api_format", &self.api_format)
             .finish()
     }
 }

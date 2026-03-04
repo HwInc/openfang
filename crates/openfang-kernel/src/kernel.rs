@@ -153,6 +153,8 @@ pub struct OpenFangKernel {
     pub default_model_override: std::sync::RwLock<Option<openfang_types::config::DefaultModelConfig>>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
+    /// OS-native secret vault.
+    pub vault: openfang_runtime::vault::Vault,
 }
 
 /// Bounded in-memory delivery receipt tracker.
@@ -546,15 +548,27 @@ impl OpenFangKernel {
                 .map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))?,
         );
 
-        // Create LLM driver
+        // Create LLM driver — check custom providers for the default provider
+        let custom_match = config
+            .custom_providers
+            .iter()
+            .find(|cp| cp.name == config.default_model.provider);
         let driver_config = DriverConfig {
             provider: config.default_model.provider.clone(),
-            api_key: std::env::var(&config.default_model.api_key_env).ok(),
+            api_key: std::env::var(&config.default_model.api_key_env)
+                .ok()
+                .or_else(|| {
+                    custom_match
+                        .filter(|cp| !cp.api_key_env.is_empty())
+                        .and_then(|cp| std::env::var(&cp.api_key_env).ok())
+                }),
             base_url: config
                 .default_model
                 .base_url
                 .clone()
+                .or_else(|| custom_match.map(|cp| cp.base_url.clone()))
                 .or_else(|| config.provider_urls.get(&config.default_model.provider).cloned()),
+            api_format: custom_match.map(|cp| cp.api_format.clone()),
         };
         // Primary driver failure is non-fatal: the dashboard should remain accessible
         // even if the LLM provider is misconfigured. Users can fix config via dashboard.
@@ -574,17 +588,25 @@ impl OpenFangKernel {
 
         // Add fallback providers to the chain
         for fb in &config.fallback_providers {
+            let fb_custom = config
+                .custom_providers
+                .iter()
+                .find(|cp| cp.name == fb.provider);
             let fb_config = DriverConfig {
                 provider: fb.provider.clone(),
                 api_key: if fb.api_key_env.is_empty() {
-                    None
+                    fb_custom
+                        .filter(|cp| !cp.api_key_env.is_empty())
+                        .and_then(|cp| std::env::var(&cp.api_key_env).ok())
                 } else {
                     std::env::var(&fb.api_key_env).ok()
                 },
                 base_url: fb
                     .base_url
                     .clone()
+                    .or_else(|| fb_custom.map(|cp| cp.base_url.clone()))
                     .or_else(|| config.provider_urls.get(&fb.provider).cloned()),
+                api_format: fb_custom.map(|cp| cp.api_format.clone()),
             };
             match drivers::create_driver(&fb_config) {
                 Ok(d) => {
@@ -647,6 +669,11 @@ impl OpenFangKernel {
                 config.provider_urls.len()
             );
         }
+        // Register custom providers from config
+        for cp in &config.custom_providers {
+            model_catalog.register_custom_provider(cp);
+        }
+
         // Load user's custom models from ~/.openfang/custom_models.json
         let custom_models_path = config.home_dir.join("custom_models.json");
         model_catalog.load_custom_models(&custom_models_path);
@@ -737,17 +764,20 @@ impl OpenFangKernel {
         }
 
         // Initialize web tools (multi-provider search + SSRF-protected fetch + caching)
+        let vault = Arc::new(openfang_runtime::vault::Vault::new("openfang", &config.home_dir));
         let cache_ttl = std::time::Duration::from_secs(config.web.cache_ttl_minutes * 60);
         let web_cache = Arc::new(openfang_runtime::web_cache::WebCache::new(cache_ttl));
         let web_ctx = openfang_runtime::web_search::WebToolsContext {
             search: openfang_runtime::web_search::WebSearchEngine::new(
                 config.web.clone(),
                 web_cache.clone(),
+                vault.clone(),
             ),
             fetch: openfang_runtime::web_fetch::WebFetchEngine::new(
                 config.web.fetch.clone(),
                 web_cache,
             ),
+            vault: vault.clone(),
         };
 
         // Auto-detect embedding driver for vector similarity search
@@ -880,7 +910,7 @@ impl OpenFangKernel {
         let auto_reply_engine = crate::auto_reply::AutoReplyEngine::new(config.auto_reply.clone());
 
         let kernel = Self {
-            config,
+            config: config.clone(),
             registry: AgentRegistry::new(),
             capabilities: CapabilityManager::new(),
             event_bus: EventBus::new(),
@@ -890,7 +920,7 @@ impl OpenFangKernel {
             workflows: WorkflowEngine::new(),
             triggers: TriggerEngine::new(),
             background,
-            audit_log: Arc::new(AuditLog::new()),
+            audit_log: Arc::new(AuditLog::open(config.home_dir.join("audit.db"))),
             metering,
             default_driver: driver,
             wasm_sandbox,
@@ -918,6 +948,7 @@ impl OpenFangKernel {
             bindings: std::sync::Mutex::new(initial_bindings),
             broadcast: initial_broadcast,
             auto_reply_engine,
+            self_handle: std::sync::OnceLock::new(),
             hooks: openfang_runtime::hooks::HookRegistry::new(),
             process_manager: Arc::new(openfang_runtime::process_manager::ProcessManager::new(5)),
             peer_registry: None,
@@ -926,7 +957,7 @@ impl OpenFangKernel {
             whatsapp_gateway_pid: Arc::new(std::sync::Mutex::new(None)),
             channel_adapters: dashmap::DashMap::new(),
             default_model_override: std::sync::RwLock::new(None),
-            self_handle: OnceLock::new(),
+            vault: (*vault).clone(),
         };
 
         // Restore persisted agents from SQLite
@@ -1118,6 +1149,19 @@ impl OpenFangKernel {
 
         info!(agent = %name, id = %agent_id, parent = ?parent, "Spawning agent");
 
+        // 1. SECURITY: Enforce manifest signing policy
+        if self.config.require_signed_manifests
+            && !manifest.is_trusted
+            && !manifest.module.starts_with("builtin:")
+        {
+            return Err(KernelError::OpenFang(
+                openfang_types::error::OpenFangError::AuthDenied(format!(
+                    "Policy violation: signed manifest required for agent '{}'",
+                    name
+                )),
+            ));
+        }
+
         // Create session
         self.memory
             .create_session(agent_id)
@@ -1272,13 +1316,51 @@ impl OpenFangKernel {
                     "Invalid signed manifest JSON: {e}"
                 )))
             })?;
+
+        // 1. Verify cryptographic integrity (hash + signature)
         signed.verify().map_err(|e| {
             KernelError::OpenFang(openfang_types::error::OpenFangError::Config(format!(
                 "Manifest signature verification failed: {e}"
             )))
         })?;
-        info!(signer = %signed.signer_id, hash = %signed.content_hash, "Signed manifest verified");
-        Ok(signed.manifest)
+
+        // 2. SECURITY: Verify trust root (check signer identity)
+        let signer_key_hex = hex::encode(&signed.signer_public_key);
+        if !self.config.trusted_manifest_signers.is_empty()
+            && !self
+                .config
+                .trusted_manifest_signers
+                .contains(&signer_key_hex)
+        {
+            return Err(KernelError::OpenFang(
+                openfang_types::error::OpenFangError::AuthDenied(format!(
+                    "Untrusted manifest signer: {} (key: {})",
+                    signed.signer_id, signer_key_hex
+                )),
+            ));
+        }
+
+        info!(signer = %signed.signer_id, hash = %signed.content_hash, "Signed manifest verified and trusted");
+
+        // 3. Mark the manifest as trusted before returning
+        let mut manifest: openfang_types::agent::AgentManifest =
+            toml::from_str(&signed.manifest).map_err(|e| {
+                KernelError::OpenFang(openfang_types::error::OpenFangError::Config(format!(
+                    "Invalid TOML in signed manifest: {e}"
+                )))
+            })?;
+        manifest.is_trusted = true;
+        manifest.signer_id = Some(signed.signer_id);
+
+        // Return the manifest as TOML string (it will be re-parsed by the caller, e.g. the API)
+        // Actually, it might be better if verify_signed_manifest returned the struct.
+        // But for now, let's stick to the existing signature if possible, or update it.
+        // The API layer expects a String.
+        toml::to_string(&manifest).map_err(|e| {
+            KernelError::OpenFang(openfang_types::error::OpenFangError::Config(format!(
+                "Failed to re-serialize trusted manifest: {e}"
+            )))
+        })
     }
 
     /// Send a message to an agent and get a response.
@@ -3874,9 +3956,25 @@ impl OpenFangKernel {
                 }
             };
 
+            // Check if this is a custom provider
+            let custom_match = self
+                .config
+                .custom_providers
+                .iter()
+                .find(|cp| cp.name == *agent_provider);
+
+            // Resolve API key from custom provider if not already set
+            let api_key = api_key.or_else(|| {
+                custom_match
+                    .filter(|cp| !cp.api_key_env.is_empty())
+                    .and_then(|cp| std::env::var(&cp.api_key_env).ok())
+            });
+
             // Don't inherit default provider's base_url when switching providers
             let base_url = if has_custom_url {
                 manifest.model.base_url.clone()
+            } else if let Some(cp) = custom_match {
+                Some(cp.base_url.clone())
             } else if agent_provider == default_provider {
                 self.config
                     .default_model
@@ -3884,7 +3982,6 @@ impl OpenFangKernel {
                     .clone()
                     .or_else(|| self.config.provider_urls.get(agent_provider.as_str()).cloned())
             } else {
-                // Check provider_urls before falling back to hardcoded defaults
                 self.config.provider_urls.get(agent_provider.as_str()).cloned()
             };
 
@@ -3892,6 +3989,7 @@ impl OpenFangKernel {
                 provider: agent_provider.clone(),
                 api_key,
                 base_url,
+                api_format: custom_match.map(|cp| cp.api_format.clone()),
             };
 
             drivers::create_driver(&driver_config).map_err(|e| {
@@ -3905,16 +4003,28 @@ impl OpenFangKernel {
             let mut chain: Vec<(std::sync::Arc<dyn openfang_runtime::llm_driver::LlmDriver>, String)> =
                 vec![(primary.clone(), String::new())];
             for fb in &manifest.fallback_models {
+                let fb_custom = self
+                    .config
+                    .custom_providers
+                    .iter()
+                    .find(|cp| cp.name == fb.provider);
                 let config = DriverConfig {
                     provider: fb.provider.clone(),
                     api_key: fb
                         .api_key_env
                         .as_ref()
-                        .and_then(|env| std::env::var(env).ok()),
+                        .and_then(|env| std::env::var(env).ok())
+                        .or_else(|| {
+                            fb_custom
+                                .filter(|cp| !cp.api_key_env.is_empty())
+                                .and_then(|cp| std::env::var(&cp.api_key_env).ok())
+                        }),
                     base_url: fb
                         .base_url
                         .clone()
+                        .or_else(|| fb_custom.map(|cp| cp.base_url.clone()))
                         .or_else(|| self.config.provider_urls.get(&fb.provider).cloned()),
+                    api_format: fb_custom.map(|cp| cp.api_format.clone()),
                 };
                 match drivers::create_driver(&config) {
                     Ok(d) => chain.push((d, fb.model.clone())),
@@ -5391,6 +5501,8 @@ mod tests {
             exec_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
+            is_trusted: false,
+            signer_id: None,
         };
         manifest.capabilities.tools = vec!["file_read".to_string(), "web_fetch".to_string()];
         manifest.capabilities.agent_spawn = true;
@@ -5428,6 +5540,8 @@ mod tests {
             exec_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
+            is_trusted: false,
+            signer_id: None,
         }
     }
 

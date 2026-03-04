@@ -7,7 +7,9 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 use std::sync::Mutex;
+use rusqlite::{params, Connection};
 
 /// Categories of auditable actions within the agent runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,19 +79,48 @@ fn compute_entry_hash(
 /// An append-only, tamper-evident audit log using a Merkle hash chain.
 ///
 /// Thread-safe — all access is serialised through internal mutexes.
+/// Entries are persisted to a SQLite database.
 pub struct AuditLog {
-    entries: Mutex<Vec<AuditEntry>>,
-    tip: Mutex<String>,
+    conn: Mutex<Connection>,
 }
 
 impl AuditLog {
-    /// Creates a new empty audit log.
-    ///
-    /// The initial tip hash is 64 zero characters (the "genesis" sentinel).
+    /// Creates a new in-memory audit log for testing.
     pub fn new() -> Self {
+        Self::open_in_memory()
+    }
+
+    /// Opens an in-memory audit log.
+    pub fn open_in_memory() -> Self {
+        let conn = Connection::open_in_memory().expect("Failed to open in-memory audit DB");
+        Self::init_db(conn, None)
+    }
+
+    /// Opens or creates an audit log at the specified path.
+    pub fn open(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let conn = Connection::open(&path).expect("Failed to open audit DB");
+        Self::init_db(conn, Some(path))
+    }
+
+    fn init_db(conn: Connection, db_path: Option<PathBuf>) -> Self {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS audit_entries (
+                seq INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                prev_hash TEXT NOT NULL,
+                hash TEXT NOT NULL
+            )",
+            [],
+        )
+        .expect("Failed to create audit_entries table");
+
         Self {
-            entries: Mutex::new(Vec::new()),
-            tip: Mutex::new("0".repeat(64)),
+            conn: Mutex::new(conn),
         }
     }
 
@@ -109,28 +140,43 @@ impl AuditLog {
         let outcome = outcome.into();
         let timestamp = Utc::now().to_rfc3339();
 
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let mut tip = self.tip.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
 
-        let seq = entries.len() as u64;
-        let prev_hash = tip.clone();
+        // Get current tip and sequence
+        let (seq, prev_hash): (u64, String) = conn
+            .query_row(
+                "SELECT seq, hash FROM audit_entries ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, u64>(0)? + 1, row.get::<_, String>(1)?)),
+            )
+            .unwrap_or((0, "0".repeat(64)));
 
         let hash = compute_entry_hash(
-            seq, &timestamp, &agent_id, &action, &detail, &outcome, &prev_hash,
+            seq,
+            &timestamp,
+            &agent_id,
+            &action,
+            &detail,
+            &outcome,
+            &prev_hash,
         );
 
-        entries.push(AuditEntry {
-            seq,
-            timestamp,
-            agent_id,
-            action,
-            detail,
-            outcome,
-            prev_hash,
-            hash: hash.clone(),
-        });
+        conn.execute(
+            "INSERT INTO audit_entries (seq, timestamp, agent_id, action, detail, outcome, prev_hash, hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                seq,
+                timestamp,
+                agent_id,
+                action.to_string(),
+                detail,
+                outcome,
+                prev_hash,
+                hash
+            ],
+        )
+        .expect("Failed to insert audit entry");
 
-        *tip = hash.clone();
         hash
     }
 
@@ -139,10 +185,31 @@ impl AuditLog {
     /// Returns `Ok(())` if the chain is intact, or `Err(msg)` describing
     /// the first inconsistency found.
     pub fn verify_integrity(&self) -> Result<(), String> {
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn
+            .prepare("SELECT seq, timestamp, agent_id, action, detail, outcome, prev_hash, hash FROM audit_entries ORDER BY seq ASC")
+            .map_err(|e| format!("Failed to prepare integrity check: {e}"))?;
+
         let mut expected_prev = "0".repeat(64);
 
-        for entry in entries.iter() {
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(AuditEntry {
+                    seq: row.get::<_, u64>(0)?,
+                    timestamp: row.get::<_, String>(1)?,
+                    agent_id: row.get::<_, String>(2)?,
+                    action: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(3)?))
+                        .unwrap_or(AuditAction::AuthAttempt),
+                    detail: row.get::<_, String>(4)?,
+                    outcome: row.get::<_, String>(5)?,
+                    prev_hash: row.get::<_, String>(6)?,
+                    hash: row.get::<_, String>(7)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query audit entries: {e}"))?;
+
+        for entry_res in rows {
+            let entry = entry_res.map_err(|e| format!("DB row error: {e}"))?;
             if entry.prev_hash != expected_prev {
                 return Err(format!(
                     "chain break at seq {}: expected prev_hash {} but found {}",
@@ -176,27 +243,53 @@ impl AuditLog {
     /// Returns the current tip hash (the hash of the most recent entry,
     /// or the genesis sentinel if the log is empty).
     pub fn tip_hash(&self) -> String {
-        self.tip.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.query_row(
+            "SELECT hash FROM audit_entries ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "0".repeat(64))
     }
 
     /// Returns the number of entries in the log.
     pub fn len(&self) -> usize {
-        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.query_row("SELECT COUNT(*) FROM audit_entries", [], |row| row.get(0))
+            .unwrap_or(0)
     }
 
     /// Returns whether the log is empty.
     pub fn is_empty(&self) -> bool {
-        self.entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
+        self.len() == 0
     }
 
     /// Returns up to the most recent `n` entries (cloned).
     pub fn recent(&self, n: usize) -> Vec<AuditEntry> {
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let start = entries.len().saturating_sub(n);
-        entries[start..].to_vec()
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn
+            .prepare("SELECT seq, timestamp, agent_id, action, detail, outcome, prev_hash, hash FROM audit_entries ORDER BY seq DESC LIMIT ?1")
+            .expect("Failed to prepare query");
+
+        let rows = stmt
+            .query_map(params![n], |row| {
+                Ok(AuditEntry {
+                    seq: row.get::<_, u64>(0)?,
+                    timestamp: row.get::<_, String>(1)?,
+                    agent_id: row.get::<_, String>(2)?,
+                    action: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(3)?))
+                        .unwrap_or(AuditAction::AuthAttempt),
+                    detail: row.get::<_, String>(4)?,
+                    outcome: row.get::<_, String>(5)?,
+                    prev_hash: row.get::<_, String>(6)?,
+                    hash: row.get::<_, String>(7)?,
+                })
+            })
+            .expect("Failed to execute query");
+
+        let mut results: Vec<_> = rows.collect::<Result<Vec<_>, _>>().expect("DB read error");
+        results.reverse();
+        results
     }
 }
 
@@ -246,10 +339,14 @@ mod tests {
         log.record("agent-1", AuditAction::ShellExec, "rm -rf /", "denied");
         log.record("agent-1", AuditAction::MemoryAccess, "read key foo", "ok");
 
-        // Tamper with an entry
+        // Tamper with an entry by reaching into the DB
         {
-            let mut entries = log.entries.lock().unwrap();
-            entries[1].detail = "echo hello".to_string(); // change the detail
+            let conn = log.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE audit_entries SET detail = ?1 WHERE seq = 1",
+                ["echo hello"],
+            )
+            .unwrap();
         }
 
         let result = log.verify_integrity();

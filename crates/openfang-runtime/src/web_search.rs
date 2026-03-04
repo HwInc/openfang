@@ -19,17 +19,19 @@ pub struct WebSearchEngine {
     config: WebConfig,
     client: reqwest::Client,
     cache: Arc<WebCache>,
+    vault: Arc<crate::vault::Vault>,
 }
 
 /// Context that bundles both search and fetch engines for passing through the tool runner.
 pub struct WebToolsContext {
     pub search: WebSearchEngine,
     pub fetch: crate::web_fetch::WebFetchEngine,
+    pub vault: Arc<crate::vault::Vault>,
 }
 
 impl WebSearchEngine {
-    /// Create a new search engine from config with a shared cache.
-    pub fn new(config: WebConfig, cache: Arc<WebCache>) -> Self {
+    /// Create a new search engine from config with a shared cache and vault.
+    pub fn new(config: WebConfig, cache: Arc<WebCache>, vault: Arc<crate::vault::Vault>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()
@@ -38,6 +40,7 @@ impl WebSearchEngine {
             config,
             client,
             cache,
+            vault,
         }
     }
 
@@ -70,7 +73,7 @@ impl WebSearchEngine {
     /// Priority: Tavily → Brave → Perplexity → DuckDuckGo
     async fn search_auto(&self, query: &str, max_results: usize) -> Result<String, String> {
         // Tavily first (AI-agent-native)
-        if resolve_api_key(&self.config.tavily.api_key_env).is_some() {
+        if resolve_api_key(&self.config.tavily.api_key_env, &self.vault).is_some() {
             debug!("Auto: trying Tavily");
             match self.search_tavily(query, max_results).await {
                 Ok(result) => return Ok(result),
@@ -79,7 +82,7 @@ impl WebSearchEngine {
         }
 
         // Brave second
-        if resolve_api_key(&self.config.brave.api_key_env).is_some() {
+        if resolve_api_key(&self.config.brave.api_key_env, &self.vault).is_some() {
             debug!("Auto: trying Brave");
             match self.search_brave(query, max_results).await {
                 Ok(result) => return Ok(result),
@@ -88,7 +91,7 @@ impl WebSearchEngine {
         }
 
         // Perplexity third
-        if resolve_api_key(&self.config.perplexity.api_key_env).is_some() {
+        if resolve_api_key(&self.config.perplexity.api_key_env, &self.vault).is_some() {
             debug!("Auto: trying Perplexity");
             match self.search_perplexity(query).await {
                 Ok(result) => return Ok(result),
@@ -104,7 +107,7 @@ impl WebSearchEngine {
     /// Search via Brave Search API.
     async fn search_brave(&self, query: &str, max_results: usize) -> Result<String, String> {
         let api_key =
-            resolve_api_key(&self.config.brave.api_key_env).ok_or("Brave API key not set")?;
+            resolve_api_key(&self.config.brave.api_key_env, &self.vault).ok_or("Brave API key not set")?;
 
         let mut params = vec![("q", query.to_string()), ("count", max_results.to_string())];
         if !self.config.brave.country.is_empty() {
@@ -165,7 +168,7 @@ impl WebSearchEngine {
     /// Search via Tavily API (AI-agent-native search).
     async fn search_tavily(&self, query: &str, max_results: usize) -> Result<String, String> {
         let api_key =
-            resolve_api_key(&self.config.tavily.api_key_env).ok_or("Tavily API key not set")?;
+            resolve_api_key(&self.config.tavily.api_key_env, &self.vault).ok_or("Tavily API key not set")?;
 
         let body = serde_json::json!({
             "api_key": api_key.as_str(),
@@ -224,7 +227,7 @@ impl WebSearchEngine {
 
     /// Search via Perplexity AI (chat completions endpoint).
     async fn search_perplexity(&self, query: &str) -> Result<String, String> {
-        let api_key = resolve_api_key(&self.config.perplexity.api_key_env)
+        let api_key = resolve_api_key(&self.config.perplexity.api_key_env, &self.vault)
             .ok_or("Perplexity API key not set")?;
 
         let body = serde_json::json!({
@@ -419,13 +422,22 @@ pub fn urldecode(s: &str) -> String {
     result
 }
 
-/// Resolve an API key from an environment variable name.
+/// Resolve an API key from an environment variable name OR from the OS vault.
 /// Returns `Zeroizing<String>` that auto-wipes from memory on drop.
-fn resolve_api_key(env_var: &str) -> Option<Zeroizing<String>> {
-    std::env::var(env_var)
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map(Zeroizing::new)
+fn resolve_api_key(env_var: &str, vault: &crate::vault::Vault) -> Option<Zeroizing<String>> {
+    // 1. Try environment variable
+    if let Ok(v) = std::env::var(env_var) {
+        if !v.is_empty() {
+            return Some(Zeroizing::new(v));
+        }
+    }
+
+    // 2. Try OS Vault
+    if let Some(v) = vault.get_secret(env_var) {
+        return Some(Zeroizing::new(v));
+    }
+
+    None
 }
 
 #[cfg(test)]
