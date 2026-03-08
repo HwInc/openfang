@@ -343,6 +343,11 @@ fn estimate_cost_rates(model: &str) -> (f64, f64) {
         return (0.40, 0.40);
     }
 
+    // ── Venice.ai ──────────────────────────────────────────────
+    if model.contains("venice") {
+        return (0.20, 0.90);
+    }
+
     // ── Open-source (Groq, Together, etc.) ─────────────────────
     if model.contains("llama-4-maverick") {
         return (0.50, 0.77);
@@ -376,6 +381,12 @@ fn estimate_cost_rates(model: &str) -> (f64, f64) {
     }
 
     // ── Zhipu / GLM ─────────────────────────────────────────────
+    if model.contains("glm-5") {
+        return (2.00, 8.00);
+    }
+    if model.contains("glm-4.7") {
+        return (1.50, 5.00);
+    }
     if model.contains("glm-4-flash") {
         return (0.10, 0.10);
     }

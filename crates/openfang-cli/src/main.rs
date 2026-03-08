@@ -1163,6 +1163,10 @@ fn cmd_init(quick: bool) {
 
     if quick {
         cmd_init_quick(&openfang_dir);
+    } else if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        ui::hint("Non-interactive terminal detected — running in quick mode");
+        ui::hint("For the interactive wizard, run: openfang init (in a terminal)");
+        cmd_init_quick(&openfang_dir);
     } else {
         cmd_init_interactive(&openfang_dir);
     }
@@ -1283,9 +1287,10 @@ fn launch_desktop_app(_openfang_dir: &std::path::Path) {
             ui::blank();
             if let Some(base) = find_daemon() {
                 let url = format!("{base}/");
-                if !open_in_browser(&url) {
-                    ui::hint(&format!("Visit: {url}"));
-                }
+                let _ = open_in_browser(&url);
+                // Always print the URL — browser launch may silently fail
+                // (e.g., Chromium sandbox EPERM in containers)
+                ui::hint(&format!("Dashboard: {url}"));
             }
         }
     }
@@ -1333,7 +1338,7 @@ fn provider_list() -> Vec<(&'static str, &'static str, &'static str, &'static st
         (
             "openrouter",
             "OPENROUTER_API_KEY",
-            "openrouter/auto",
+            "openrouter/anthropic/claude-sonnet-4",
             "OpenRouter",
         ),
     ]
@@ -2075,20 +2080,23 @@ fn cmd_doctor(json: bool, repair: bool) {
             }
             let answer = prompt_input("    Create default config? [Y/n] ");
             if answer.is_empty() || answer.starts_with('y') || answer.starts_with('Y') {
-                let default_config = r#"# OpenFang Agent OS configuration
+                let (provider, api_key_env, model) = detect_best_provider();
+                let default_config = format!(
+                    r#"# OpenFang Agent OS configuration
 # See https://github.com/RightNow-AI/openfang for documentation
 
 # For Docker, change to "0.0.0.0:4200" or set OPENFANG_LISTEN env var.
 api_listen = "127.0.0.1:4200"
 
 [default_model]
-provider = "groq"
-model = "llama-3.3-70b-versatile"
-api_key_env = "GROQ_API_KEY"
+provider = "{provider}"
+model = "{model}"
+api_key_env = "{api_key_env}"
 
 [memory]
 decay_rate = 0.05
-"#;
+"#
+                );
                 let _ = std::fs::create_dir_all(&openfang_dir);
                 if std::fs::write(&config_path, default_config).is_ok() {
                     restrict_file_permissions(&config_path);
@@ -2625,7 +2633,7 @@ decay_rate = 0.05
                         checks.push(serde_json::json!({"check": "daemon_uptime", "status": "ok", "secs": uptime}));
                     }
                     if let Some(db_status) = body.get("database").and_then(|v| v.as_str()) {
-                        if db_status == "ok" {
+                        if db_status == "connected" || db_status == "ok" {
                             if !json {
                                 ui::check_ok("Database connectivity: OK");
                             }
@@ -2947,8 +2955,14 @@ pub(crate) fn open_in_browser(url: &str) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
+        // Detach from parent to avoid inheriting sandbox restrictions.
+        // Some Chromium-based browsers fail with EPERM when launched from
+        // restricted environments (containers, snaps, flatpaks).
         std::process::Command::new("xdg-open")
             .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .is_ok()
     }

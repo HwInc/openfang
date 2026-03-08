@@ -145,7 +145,7 @@ impl WebSearchEngine {
             .unwrap_or_default();
 
         if results.is_empty() {
-            return Ok(format!("No results found for '{query}' (Brave)."));
+            return Err(format!("No results found for '{query}' (Brave)."));
         }
 
         let mut output = format!("Search results for '{query}' (Brave):\n\n");
@@ -219,7 +219,7 @@ impl WebSearchEngine {
         }
 
         if results.is_empty() && !output.contains("AI Summary") {
-            return Ok(format!("No results found for '{query}' (Tavily)."));
+            return Err(format!("No results found for '{query}' (Tavily)."));
         }
 
         Ok(wrap_external_content("tavily-search", &output))
@@ -300,7 +300,7 @@ impl WebSearchEngine {
         let results = parse_ddg_results(&body, max_results);
 
         if results.is_empty() {
-            return Ok(format!("No results found for '{query}'."));
+            return Err(format!("No results found for '{query}'."));
         }
 
         let mut output = format!("Search results for '{query}':\n\n");
