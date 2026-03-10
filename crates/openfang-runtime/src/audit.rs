@@ -5,11 +5,11 @@
 //! the previous entry, forming a tamper-evident chain (similar to a blockchain).
 
 use chrono::Utc;
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use std::sync::Mutex;
-use rusqlite::{params, Connection};
+use std::sync::{Arc, Mutex};
 
 /// Categories of auditable actions within the agent runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +55,24 @@ pub struct AuditEntry {
     pub hash: String,
 }
 
+fn action_from_str(s: &str) -> AuditAction {
+    match s {
+        "ToolInvoke" => AuditAction::ToolInvoke,
+        "CapabilityCheck" => AuditAction::CapabilityCheck,
+        "AgentSpawn" => AuditAction::AgentSpawn,
+        "AgentKill" => AuditAction::AgentKill,
+        "AgentMessage" => AuditAction::AgentMessage,
+        "MemoryAccess" => AuditAction::MemoryAccess,
+        "FileAccess" => AuditAction::FileAccess,
+        "NetworkAccess" => AuditAction::NetworkAccess,
+        "ShellExec" => AuditAction::ShellExec,
+        "AuthAttempt" => AuditAction::AuthAttempt,
+        "WireConnect" => AuditAction::WireConnect,
+        "ConfigChange" => AuditAction::ConfigChange,
+        _ => AuditAction::AuthAttempt,
+    }
+}
+
 /// Computes the SHA-256 hash for a single audit entry from its fields.
 fn compute_entry_hash(
     seq: u64,
@@ -78,10 +96,9 @@ fn compute_entry_hash(
 
 /// An append-only, tamper-evident audit log using a Merkle hash chain.
 ///
-/// Thread-safe — all access is serialised through internal mutexes.
-/// Entries are persisted to a SQLite database.
+/// Thread-safe — all access is serialized through an internal mutex.
 pub struct AuditLog {
-    conn: Mutex<Connection>,
+    pub(crate) conn: Arc<Mutex<Connection>>,
 }
 
 impl AuditLog {
@@ -93,18 +110,33 @@ impl AuditLog {
     /// Opens an in-memory audit log.
     pub fn open_in_memory() -> Self {
         let conn = Connection::open_in_memory().expect("Failed to open in-memory audit DB");
-        Self::init_db(conn, None)
+        Self::init_db(Arc::new(Mutex::new(conn)))
     }
 
     /// Opens or creates an audit log at the specified path.
     pub fn open(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
-        let conn = Connection::open(&path).expect("Failed to open audit DB");
-        Self::init_db(conn, Some(path))
+        let conn = Connection::open(path).expect("Failed to open audit DB");
+        Self::init_db(Arc::new(Mutex::new(conn)))
     }
 
-    fn init_db(conn: Connection, db_path: Option<PathBuf>) -> Self {
-        conn.execute(
+    /// Creates an audit log backed by a shared database connection.
+    pub fn with_db(conn: Arc<Mutex<Connection>>) -> Self {
+        let log = Self::init_db(conn);
+        let count = log.len();
+        if count > 0 {
+            if let Err(e) = log.verify_integrity() {
+                tracing::error!("Audit trail integrity check FAILED on boot: {e}");
+            } else {
+                tracing::info!("Audit trail loaded: {count} entries, chain integrity OK");
+            }
+        }
+        log
+    }
+
+    fn init_db(conn: Arc<Mutex<Connection>>) -> Self {
+        let db = conn.lock().unwrap_or_else(|e| e.into_inner());
+        db.execute(
             "CREATE TABLE IF NOT EXISTS audit_entries (
                 seq INTEGER PRIMARY KEY,
                 timestamp TEXT NOT NULL,
@@ -118,16 +150,11 @@ impl AuditLog {
             [],
         )
         .expect("Failed to create audit_entries table");
-
-        Self {
-            conn: Mutex::new(conn),
-        }
+        drop(db);
+        Self { conn }
     }
 
     /// Records a new auditable event and returns the SHA-256 hash of the entry.
-    ///
-    /// The entry is atomically appended to the chain with the current tip as
-    /// its `prev_hash`, and the tip is advanced to the new hash.
     pub fn record(
         &self,
         agent_id: impl Into<String>,
@@ -142,7 +169,6 @@ impl AuditLog {
 
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Get current tip and sequence
         let (seq, prev_hash): (u64, String) = conn
             .query_row(
                 "SELECT seq, hash FROM audit_entries ORDER BY seq DESC LIMIT 1",
@@ -181,9 +207,6 @@ impl AuditLog {
     }
 
     /// Walks the entire chain and recomputes every hash to detect tampering.
-    ///
-    /// Returns `Ok(())` if the chain is intact, or `Err(msg)` describing
-    /// the first inconsistency found.
     pub fn verify_integrity(&self) -> Result<(), String> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
@@ -198,8 +221,7 @@ impl AuditLog {
                     seq: row.get::<_, u64>(0)?,
                     timestamp: row.get::<_, String>(1)?,
                     agent_id: row.get::<_, String>(2)?,
-                    action: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(3)?))
-                        .unwrap_or(AuditAction::AuthAttempt),
+                    action: action_from_str(&row.get::<_, String>(3)?),
                     detail: row.get::<_, String>(4)?,
                     outcome: row.get::<_, String>(5)?,
                     prev_hash: row.get::<_, String>(6)?,
@@ -240,8 +262,7 @@ impl AuditLog {
         Ok(())
     }
 
-    /// Returns the current tip hash (the hash of the most recent entry,
-    /// or the genesis sentinel if the log is empty).
+    /// Returns the current tip hash.
     pub fn tip_hash(&self) -> String {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
@@ -277,8 +298,7 @@ impl AuditLog {
                     seq: row.get::<_, u64>(0)?,
                     timestamp: row.get::<_, String>(1)?,
                     agent_id: row.get::<_, String>(2)?,
-                    action: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(3)?))
-                        .unwrap_or(AuditAction::AuthAttempt),
+                    action: action_from_str(&row.get::<_, String>(3)?),
                     detail: row.get::<_, String>(4)?,
                     outcome: row.get::<_, String>(5)?,
                     prev_hash: row.get::<_, String>(6)?,
@@ -367,5 +387,53 @@ mod tests {
         let h2 = log.record("b", AuditAction::AgentKill, "kill", "ok");
         assert_eq!(log.tip_hash(), h2);
         assert_ne!(h2, h1);
+    }
+
+    #[test]
+    fn test_audit_persists_to_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE audit_entries (
+                seq INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                prev_hash TEXT NOT NULL,
+                hash TEXT NOT NULL
+            )",
+        )
+        .unwrap();
+
+        let db = Arc::new(Mutex::new(conn));
+
+        // Record entries with DB
+        let log = AuditLog::with_db(Arc::clone(&db));
+        log.record("agent-1", AuditAction::AgentSpawn, "spawn test", "ok");
+        log.record("agent-1", AuditAction::ShellExec, "ls", "ok");
+        assert_eq!(log.len(), 2);
+
+        // Verify entries in database
+        let db_conn = db.lock().unwrap();
+        let count: i64 = db_conn
+            .query_row("SELECT COUNT(*) FROM audit_entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        drop(db_conn);
+
+        // Simulate restart: create new AuditLog from same DB
+        let log2 = AuditLog::with_db(Arc::clone(&db));
+        assert_eq!(log2.len(), 2);
+        assert!(log2.verify_integrity().is_ok());
+
+        // Chain continues correctly after restart
+        log2.record("agent-2", AuditAction::ToolInvoke, "file_read", "ok");
+        assert_eq!(log2.len(), 3);
+        assert!(log2.verify_integrity().is_ok());
+
+        // Verify tip is correct
+        let entries = log2.recent(3);
+        assert_eq!(entries[2].prev_hash, entries[1].hash);
     }
 }

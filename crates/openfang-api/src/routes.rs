@@ -36,6 +36,10 @@ pub struct AppState {
     /// ClawHub response cache — prevents 429 rate limiting on rapid dashboard refreshes.
     /// Maps cache key → (fetched_at, response_json) with 120s TTL.
     pub clawhub_cache: DashMap<String, (Instant, serde_json::Value)>,
+    /// Probe cache for local provider health checks (ollama/vllm/lmstudio).
+    /// Avoids blocking the `/api/providers` endpoint on TCP timeouts to
+    /// unreachable local services. 60-second TTL.
+    pub provider_probe_cache: openfang_runtime::provider_health::ProbeCache,
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -43,9 +47,49 @@ pub async fn spawn_agent(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SpawnRequest>,
 ) -> impl IntoResponse {
+    // Resolve template name → manifest_toml if template is provided and manifest_toml is empty
+    let manifest_toml = if req.manifest_toml.trim().is_empty() {
+        if let Some(ref tmpl_name) = req.template {
+            // Sanitize template name to prevent path traversal
+            let safe_name = tmpl_name
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                .collect::<String>();
+            if safe_name.is_empty() || safe_name != *tmpl_name {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid template name"})),
+                );
+            }
+            let tmpl_path = state
+                .kernel
+                .config
+                .home_dir
+                .join("agents")
+                .join(&safe_name)
+                .join("agent.toml");
+            match std::fs::read_to_string(&tmpl_path) {
+                Ok(content) => content,
+                Err(_) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": format!("Template '{}' not found", safe_name)})),
+                    );
+                }
+            }
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Either 'manifest_toml' or 'template' is required"})),
+            );
+        }
+    } else {
+        req.manifest_toml.clone()
+    };
+
     // SECURITY: Reject oversized manifests to prevent parser memory exhaustion.
     const MAX_MANIFEST_SIZE: usize = 1024 * 1024; // 1MB
-    if req.manifest_toml.len() > MAX_MANIFEST_SIZE {
+    if manifest_toml.len() > MAX_MANIFEST_SIZE {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({"error": "Manifest too large (max 1MB)"})),
@@ -53,21 +97,20 @@ pub async fn spawn_agent(
     }
 
     // Determine the manifest source. Use verified content if signature is valid.
-    let manifest: AgentManifest = if let Some(ref signed_json) = req.signed_manifest {
+    let manifest_toml_for_parse = if let Some(ref signed_json) = req.signed_manifest {
         match state.kernel.verify_signed_manifest(signed_json) {
             Ok(verified_toml) => {
-                // Ensure the signed manifest matches the provided manifest_toml (optional safety check)
-                // We'll parse the verified one as it now contains trust metadata
-                match toml::from_str(&verified_toml) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::error!("Failed to parse verified manifest TOML: {e}");
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(serde_json::json!({"error": "Verified manifest parsing failed"})),
-                        );
-                    }
+                // Ensure the signed manifest matches the provided manifest_toml
+                if verified_toml.trim() != manifest_toml.trim() {
+                    tracing::warn!("Signed manifest content does not match manifest_toml");
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(
+                            serde_json::json!({"error": "Signed manifest content does not match manifest_toml"}),
+                        ),
+                    );
                 }
+                verified_toml
             }
             Err(e) => {
                 tracing::warn!("Manifest signature verification failed: {e}");
@@ -84,15 +127,17 @@ pub async fn spawn_agent(
             }
         }
     } else {
-        match toml::from_str(&req.manifest_toml) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("Invalid manifest TOML: {e}");
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "Invalid manifest format"})),
-                );
-            }
+        manifest_toml
+    };
+
+    let manifest: AgentManifest = match toml::from_str(&manifest_toml_for_parse) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Invalid manifest TOML: {e}");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid manifest format"})),
+            );
         }
     };
 
@@ -5493,6 +5538,10 @@ pub async fn get_model(
 ///
 /// For local providers (ollama, vllm, lmstudio), also probes reachability and
 /// discovers available models via their health endpoints.
+///
+/// Probes run **concurrently** and results are **cached for 60 seconds** so the
+/// endpoint responds instantly on repeated dashboard loads even when local
+/// providers are unreachable (fixes #474).
 pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let provider_list: Vec<openfang_types::model_catalog::ProviderInfo> = {
         let catalog = state
@@ -5503,9 +5552,34 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
         catalog.list_providers().to_vec()
     };
 
+    // Collect local providers that need probing
+    let local_providers: Vec<(usize, String, String)> = provider_list
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !p.key_required && !p.base_url.is_empty())
+        .map(|(i, p)| (i, p.id.clone(), p.base_url.clone()))
+        .collect();
+
+    // Fire all probes concurrently (cached results return instantly)
+    let cache = &state.provider_probe_cache;
+    let probe_futures: Vec<_> = local_providers
+        .iter()
+        .map(|(_, id, url)| {
+            openfang_runtime::provider_health::probe_provider_cached(id, url, cache)
+        })
+        .collect();
+    let probe_results = futures::future::join_all(probe_futures).await;
+
+    // Index probe results by provider list position for O(1) lookup
+    let mut probe_map: HashMap<usize, openfang_runtime::provider_health::ProbeResult> =
+        HashMap::with_capacity(local_providers.len());
+    for ((idx, _, _), result) in local_providers.iter().zip(probe_results.into_iter()) {
+        probe_map.insert(*idx, result);
+    }
+
     let mut providers: Vec<serde_json::Value> = Vec::with_capacity(provider_list.len());
 
-    for p in &provider_list {
+    for (i, p) in provider_list.iter().enumerate() {
         let mut entry = serde_json::json!({
             "id": p.id,
             "display_name": p.display_name,
@@ -5516,10 +5590,9 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
             "base_url": p.base_url,
         });
 
-        // For local providers, add reachability info via health probe
-        if !p.key_required {
+        // For local providers, attach the probe result
+        if let Some(probe) = probe_map.remove(&i) {
             entry["is_local"] = serde_json::json!(true);
-            let probe = openfang_runtime::provider_health::probe_provider(&p.id, &p.base_url).await;
             entry["reachable"] = serde_json::json!(probe.reachable);
             entry["latency_ms"] = serde_json::json!(probe.latency_ms);
             if !probe.discovered_models.is_empty() {
@@ -5532,6 +5605,9 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
             if let Some(err) = &probe.error {
                 entry["error"] = serde_json::json!(err);
             }
+        } else if !p.key_required {
+            // Local provider with empty base_url (e.g. claude-code) — skip probing
+            entry["is_local"] = serde_json::json!(true);
         }
 
         providers.push(entry);
@@ -6332,16 +6408,18 @@ pub async fn set_model(
     };
     match state.kernel.set_agent_model(agent_id, model) {
         Ok(()) => {
-            // Return the resolved provider so frontend can update its state
-            let provider = state
+            // Return the resolved model+provider so frontend stays in sync.
+            // The model name may have been normalized (provider prefix stripped),
+            // so we read it back from the registry instead of echoing the raw input.
+            let (resolved_model, resolved_provider) = state
                 .kernel
                 .registry
                 .get(agent_id)
-                .map(|e| e.manifest.model.provider.clone())
-                .unwrap_or_default();
+                .map(|e| (e.manifest.model.model.clone(), e.manifest.model.provider.clone()))
+                .unwrap_or_else(|| (model.to_string(), String::new()));
             (
                 StatusCode::OK,
-                Json(serde_json::json!({"status": "ok", "model": model, "provider": provider})),
+                Json(serde_json::json!({"status": "ok", "model": resolved_model, "provider": resolved_provider})),
             )
         }
         Err(e) => (
@@ -6666,10 +6744,119 @@ pub async fn set_provider_key(
         .unwrap_or_else(|e| e.into_inner())
         .detect_auth();
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "saved", "provider": name})),
-    )
+    // Auto-switch default provider if current default has no working key.
+    // This fixes the common case where a user adds e.g. a Gemini key via dashboard
+    // but their agent still tries to use the previous provider (which has no key).
+    //
+    // Read the effective default from the hot-reload override (if set) rather than
+    // the stale boot-time config — a previous set_provider_key call may have already
+    // switched the default.
+    let (current_provider, current_key_env) = {
+        let guard = state
+            .kernel
+            .default_model_override
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(dm) => (dm.provider.clone(), dm.api_key_env.clone()),
+            None => (
+                state.kernel.config.default_model.provider.clone(),
+                state.kernel.config.default_model.api_key_env.clone(),
+            ),
+        }
+    };
+    let current_has_key = if current_key_env.is_empty() {
+        false
+    } else {
+        std::env::var(&current_key_env)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+    };
+    let switched = if !current_has_key && current_provider != name {
+        // Find a default model for the newly-keyed provider
+        let default_model = {
+            let catalog = state.kernel.model_catalog.read().unwrap_or_else(|e| e.into_inner());
+            catalog.default_model_for_provider(&name)
+        };
+        if let Some(model_id) = default_model {
+            // Update config.toml to persist the switch
+            let config_path = state.kernel.config.home_dir.join("config.toml");
+            let update_toml = format!(
+                "\n[default_model]\nprovider = \"{}\"\nmodel = \"{}\"\napi_key_env = \"{}\"\n",
+                name, model_id, env_var
+            );
+            if let Ok(existing) = std::fs::read_to_string(&config_path) {
+                // Remove existing [default_model] section if present, then append
+                let cleaned = remove_toml_section(&existing, "default_model");
+                let _ = std::fs::write(&config_path, format!("{}\n{}", cleaned.trim(), update_toml));
+            } else {
+                let _ = std::fs::write(&config_path, update_toml);
+            }
+
+            // Hot-update the in-memory default model override so resolve_driver()
+            // immediately creates drivers for the new provider — no restart needed.
+            {
+                let new_dm = openfang_types::config::DefaultModelConfig {
+                    provider: name.clone(),
+                    model: model_id,
+                    api_key_env: env_var.clone(),
+                    base_url: None,
+                };
+                let mut guard = state
+                    .kernel
+                    .default_model_override
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
+                *guard = Some(new_dm);
+            }
+            true
+        } else {
+            false
+        }
+    } else if current_provider == name {
+        // User is saving a key for the CURRENT default provider. The env var is
+        // already set (set_var above), but we must ensure default_model_override
+        // has the correct api_key_env so resolve_driver reads the right variable.
+        let needs_update = {
+            let guard = state
+                .kernel
+                .default_model_override
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(dm) => dm.api_key_env != env_var,
+                None => state.kernel.config.default_model.api_key_env != env_var,
+            }
+        };
+        if needs_update {
+            let mut guard = state
+                .kernel
+                .default_model_override
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let base = guard
+                .clone()
+                .unwrap_or_else(|| state.kernel.config.default_model.clone());
+            *guard = Some(openfang_types::config::DefaultModelConfig {
+                api_key_env: env_var.clone(),
+                ..base
+            });
+        }
+        false
+    } else {
+        false
+    };
+
+    let mut resp = serde_json::json!({"status": "saved", "provider": name});
+    if switched {
+        resp["switched_default"] = serde_json::json!(true);
+        resp["message"] = serde_json::json!(
+            format!("API key saved and default provider switched to '{}'.", name)
+        );
+    }
+
+    (StatusCode::OK, Json(resp))
 }
 
 /// DELETE /api/providers/{name}/key — Remove an API key for a provider.
@@ -8049,11 +8236,15 @@ pub async fn patch_agent_config(
         }
     }
 
-    // Update model/provider
+    // Update model/provider — use set_agent_model for catalog-based provider
+    // resolution when provider is not explicitly provided (fixes #387/#466:
+    // changing model from another provider without specifying provider now
+    // auto-resolves the correct provider from the model catalog).
     if let Some(ref new_model) = req.model {
         if !new_model.is_empty() {
             if let Some(ref new_provider) = req.provider {
                 if !new_provider.is_empty() {
+                    // Explicit provider given — use it directly
                     if state
                         .kernel
                         .registry
@@ -8069,27 +8260,23 @@ pub async fn patch_agent_config(
                             Json(serde_json::json!({"error": "Agent not found"})),
                         );
                     }
-                } else if state
-                    .kernel
-                    .registry
-                    .update_model(agent_id, new_model.clone())
-                    .is_err()
-                {
+                } else {
+                    // Provider is empty string — resolve from catalog
+                    if let Err(e) = state.kernel.set_agent_model(agent_id, new_model) {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": format!("{e}")})),
+                        );
+                    }
+                }
+            } else {
+                // No provider field at all — resolve from catalog
+                if let Err(e) = state.kernel.set_agent_model(agent_id, new_model) {
                     return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({"error": "Agent not found"})),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("{e}")})),
                     );
                 }
-            } else if state
-                .kernel
-                .registry
-                .update_model(agent_id, new_model.clone())
-                .is_err()
-            {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": "Agent not found"})),
-                );
             }
         }
     }
@@ -8944,7 +9131,8 @@ pub async fn config_schema(
 
     Json(serde_json::json!({
         "sections": {
-            "api": {
+            "general": {
+                "root_level": true,
                 "fields": {
                     "api_listen": "string",
                     "api_key": "string",
@@ -10289,4 +10477,26 @@ pub async fn comms_task(
             Json(serde_json::json!({"error": format!("Failed to post task: {e}")})),
         ),
     }
+}
+
+/// Remove a `[section]` and its contents from a TOML string.
+fn remove_toml_section(content: &str, section: &str) -> String {
+    let header = format!("[{}]", section);
+    let mut result = String::new();
+    let mut skipping = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == header {
+            skipping = true;
+            continue;
+        }
+        if skipping && trimmed.starts_with('[') {
+            skipping = false;
+        }
+        if !skipping {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    result
 }

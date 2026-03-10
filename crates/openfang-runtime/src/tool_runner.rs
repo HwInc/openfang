@@ -9,6 +9,7 @@ use crate::web_search::{parse_ddg_results, WebToolsContext};
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
 use openfang_types::tool::{ToolDefinition, ToolResult};
+use openfang_types::tool_compat::normalize_tool_name;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,20 +20,26 @@ const MAX_AGENT_CALL_DEPTH: u32 = 5;
 
 /// Check if a shell command should be blocked by taint tracking.
 ///
-/// Commands containing patterns that look like injected external data
-/// (e.g., piped curl commands, base64-encoded payloads) are flagged.
+/// Layer 1: Shell metacharacter injection (backticks, `$(`, `${`, etc.)
+/// Layer 2: Heuristic patterns for injected external data (piped curl, base64, eval)
+///
 /// This implements the TaintSink::shell_exec() policy from SOTA 2.
 fn check_taint_shell_exec(command: &str) -> Option<String> {
-    // Heuristic: flag commands that look like they contain embedded external URLs
-    // or base64 payloads (common injection patterns)
+    // Layer 1: Block shell metacharacters that enable command injection.
+    // Uses the same validator as subprocess_sandbox and docker_sandbox.
+    if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(command) {
+        return Some(format!(
+            "Shell metacharacter injection blocked: {reason}"
+        ));
+    }
+
+    // Layer 2: Heuristic patterns for injected external URLs / base64 payloads
     let suspicious_patterns = [
         "curl ",
         "wget ",
         "| sh",
         "| bash",
         "base64 -d",
-        "$(curl",
-        "`curl",
         "eval ",
     ];
     for pattern in &suspicious_patterns {
@@ -117,6 +124,10 @@ pub async fn execute_tool(
     docker_config: Option<&openfang_types::config::DockerSandboxConfig>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
 ) -> ToolResult {
+    // Normalize the tool name through compat mappings so LLM-hallucinated aliases
+    // (e.g. "fs-write" → "file_write") resolve to the canonical OpenFang name.
+    let tool_name = normalize_tool_name(tool_name);
+
     // Capability enforcement: reject tools not in the allowed list
     if let Some(allowed) = allowed_tools {
         if !allowed.iter().any(|t| t == tool_name) {
@@ -206,10 +217,24 @@ pub async fn execute_tool(
             }
         }
 
-        // Shell tool — exec policy + taint check
+        // Shell tool — metacharacter check + exec policy + taint check
         "shell_exec" => {
             let command = input["command"].as_str().unwrap_or("");
-            // Exec policy enforcement
+
+            // SECURITY: Always check for shell metacharacters, even in Full mode.
+            // These enable command injection regardless of exec policy.
+            if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(command) {
+                return ToolResult {
+                    tool_use_id: tool_use_id.to_string(),
+                    content: format!(
+                        "shell_exec blocked: command contains {reason}. \
+                         Shell metacharacters are never allowed."
+                    ),
+                    is_error: true,
+                };
+            }
+
+            // Exec policy enforcement (allowlist / deny / full)
             if let Some(policy) = exec_policy {
                 if let Err(reason) =
                     crate::subprocess_sandbox::validate_command_allowlist(command, policy)
@@ -225,7 +250,7 @@ pub async fn execute_tool(
                     };
                 }
             }
-            // Skip taint check for Full exec policy (e.g. hand agents that need curl for APIs)
+            // Skip heuristic taint patterns for Full exec policy (e.g. hand agents that need curl)
             let is_full_exec = exec_policy
                 .is_some_and(|p| p.mode == openfang_types::config::ExecSecurityMode::Full);
             if !is_full_exec {
@@ -1418,39 +1443,66 @@ async fn tool_shell_exec(
     let policy_timeout = exec_policy.map(|p| p.timeout_secs).unwrap_or(30);
     let timeout_secs = input["timeout_seconds"].as_u64().unwrap_or(policy_timeout);
 
-    // Shell resolution: prefer sh (Git Bash/MSYS2) on Windows to avoid cmd.exe
-    // quoting issues (% expansion mangles yt-dlp templates, " in filenames
-    // converted to # by --restrict-filenames). Fall back to cmd if sh not found.
-    #[cfg(windows)]
-    let git_sh: Option<&str> = {
-        const SH_PATHS: &[&str] = &[
-            "C:\\Program Files\\Git\\usr\\bin\\sh.exe",
-            "C:\\Program Files (x86)\\Git\\usr\\bin\\sh.exe",
-        ];
-        SH_PATHS
-            .iter()
-            .copied()
-            .find(|p| std::path::Path::new(p).exists())
-    };
-    let (shell, shell_arg) = if cfg!(windows) {
-        #[cfg(windows)]
-        {
-            if let Some(sh) = git_sh {
-                (sh, "-c")
-            } else {
-                ("cmd", "/C")
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            ("sh", "-c")
-        }
-    } else {
-        ("sh", "-c")
-    };
+    // SECURITY: Determine execution strategy based on exec policy.
+    //
+    // In Allowlist mode (default): Use direct execution via shlex argv splitting.
+    // This avoids invoking a shell interpreter, which eliminates an entire class
+    // of injection attacks (encoding tricks, $IFS, glob expansion, etc.).
+    //
+    // In Full mode: User explicitly opted into unrestricted shell access,
+    // so we use sh -c / cmd /C as before.
+    let use_direct_exec = exec_policy
+        .map(|p| p.mode == openfang_types::config::ExecSecurityMode::Allowlist)
+        .unwrap_or(true); // Default to safe mode
 
-    let mut cmd = tokio::process::Command::new(shell);
-    cmd.arg(shell_arg).arg(command);
+    let mut cmd = if use_direct_exec {
+        // SAFE PATH: Split command into argv using POSIX shell lexer rules,
+        // then execute the binary directly — no shell interpreter involved.
+        let argv = shlex::split(command).ok_or_else(|| {
+            "Command contains unmatched quotes or invalid shell syntax".to_string()
+        })?;
+        if argv.is_empty() {
+            return Err("Empty command after parsing".to_string());
+        }
+        let mut c = tokio::process::Command::new(&argv[0]);
+        if argv.len() > 1 {
+            c.args(&argv[1..]);
+        }
+        c
+    } else {
+        // UNSAFE PATH: Full mode — user explicitly opted in to shell interpretation.
+        // Shell resolution: prefer sh (Git Bash/MSYS2) on Windows.
+        #[cfg(windows)]
+        let git_sh: Option<&str> = {
+            const SH_PATHS: &[&str] = &[
+                "C:\\Program Files\\Git\\usr\\bin\\sh.exe",
+                "C:\\Program Files (x86)\\Git\\usr\\bin\\sh.exe",
+            ];
+            SH_PATHS
+                .iter()
+                .copied()
+                .find(|p| std::path::Path::new(p).exists())
+        };
+        let (shell, shell_arg) = if cfg!(windows) {
+            #[cfg(windows)]
+            {
+                if let Some(sh) = git_sh {
+                    (sh, "-c")
+                } else {
+                    ("cmd", "/C")
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                ("sh", "-c")
+            }
+        } else {
+            ("sh", "-c")
+        };
+        let mut c = tokio::process::Command::new(shell);
+        c.arg(shell_arg).arg(command);
+        c
+    };
 
     // Set working directory to agent workspace so files are created there
     if let Some(ws) = workspace_root {
@@ -3215,10 +3267,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_read_missing() {
+        let bad_path = std::env::temp_dir()
+            .join("openfang_test_nonexistent_99999")
+            .join("file.txt");
         let result = execute_tool(
             "test-id",
             "file_read",
-            &serde_json::json!({"path": "/nonexistent/file.txt"}),
+            &serde_json::json!({"path": bad_path.to_str().unwrap()}),
             None,
             None,
             None,
@@ -3235,7 +3290,7 @@ mod tests {
             None, // process_manager
         )
         .await;
-        assert!(result.is_error);
+        assert!(result.is_error, "Expected error but got: {}", result.content);
     }
 
     #[tokio::test]
@@ -3424,10 +3479,14 @@ mod tests {
     #[tokio::test]
     async fn test_capability_enforcement_allowed() {
         let allowed = vec!["file_read".to_string()];
+        // Use a cross-platform nonexistent path
+        let bad_path = std::env::temp_dir()
+            .join("openfang_test_nonexistent_12345")
+            .join("file.txt");
         let result = execute_tool(
             "test-id",
             "file_read",
-            &serde_json::json!({"path": "/nonexistent/file.txt"}),
+            &serde_json::json!({"path": bad_path.to_str().unwrap()}),
             None,
             Some(&allowed),
             None,
@@ -3445,8 +3504,81 @@ mod tests {
         )
         .await;
         // Should fail for file-not-found, NOT for permission denied
+        assert!(result.is_error, "Expected error but got: {}", result.content);
+        assert!(
+            result.content.contains("Failed to read") || result.content.contains("not found") || result.content.contains("No such file"),
+            "Unexpected error: {}", result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_capability_enforcement_aliased_tool_name() {
+        // Agent has "file_write" in allowed tools, but LLM calls "fs-write".
+        // After normalization, this should pass the capability check.
+        let allowed = vec![
+            "file_read".to_string(),
+            "file_write".to_string(),
+            "file_list".to_string(),
+            "shell_exec".to_string(),
+        ];
+        let result = execute_tool(
+            "test-id",
+            "fs-write", // LLM-hallucinated alias
+            &serde_json::json!({"path": "/nonexistent/file.txt", "content": "hello"}),
+            None,
+            Some(&allowed),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // media_engine
+            None, // exec_policy
+            None, // tts_engine
+            None, // docker_config
+            None, // process_manager
+        )
+        .await;
+        // Should NOT be "Permission denied" — it should normalize to file_write
+        // and pass the capability check. It will fail for other reasons (path validation).
+        assert!(
+            !result.content.contains("Permission denied"),
+            "fs-write should normalize to file_write and pass capability check, got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_capability_enforcement_aliased_denied() {
+        // Agent does NOT have file_write, and LLM calls "fs-write" — should be denied.
+        let allowed = vec!["file_read".to_string()];
+        let result = execute_tool(
+            "test-id",
+            "fs-write",
+            &serde_json::json!({"path": "/tmp/test.txt", "content": "hello"}),
+            None,
+            Some(&allowed),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // media_engine
+            None, // exec_policy
+            None, // tts_engine
+            None, // docker_config
+            None, // process_manager
+        )
+        .await;
         assert!(result.is_error);
-        assert!(result.content.contains("Failed to read"));
+        assert!(
+            result.content.contains("Permission denied"),
+            "fs-write should normalize to file_write which is not in allowed list"
+        );
     }
 
     // --- Schedule parser tests ---

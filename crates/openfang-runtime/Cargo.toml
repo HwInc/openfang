@@ -29,12 +29,13 @@ hex = { workspace = true }
 zeroize = { workspace = true }
 dashmap = { workspace = true }
 regex-lite = { workspace = true }
-tokio-tungstenite = "0.24"
 rusqlite = { workspace = true }
+tokio-tungstenite = "0.24"
 aes-gcm = { workspace = true }
 argon2 = { workspace = true }
 rand = { workspace = true }
 dirs = { workspace = true }
+shlex = "1"
 
 [dev-dependencies]
 tokio-test = { workspace = true }
